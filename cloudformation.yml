@@ -1,0 +1,401 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Parameters: 
+  Builder: 
+    Type: String
+    Description: The Cloud Native Buildpacks builder to use.
+    Default: 'paketobuildpacks/builder:base'
+
+Resources:
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    DependsOn: S3Seed
+    Properties: 
+      RepositoryName: !Sub '${AWS::StackName}Repository'
+      Code:
+        BranchName: master
+        S3: 
+          Bucket: !Ref CodePipelineArtifactStoreBucket
+          Key: src.zip
+
+  ImageRepository: 
+    Type: AWS::ECR::Repository
+    Properties: 
+      ImageScanningConfiguration: 
+        ScanOnPush: "true"
+
+  CodePipelineArtifactStoreBucket:
+    Type: 'AWS::S3::Bucket'
+
+  CodePipelineArtifactStoreBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref CodePipelineArtifactStoreBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: DenyUnEncryptedObjectUploads
+          Effect: Deny
+          Principal: '*'
+          Action: 's3:PutObject'
+          Resource: !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+          Condition:
+            StringNotEquals:
+              's3:x-amz-server-side-encryption': 'aws:kms'
+        - Sid: DenyInsecureConnections
+          Effect: Deny
+          Principal: '*'
+          Action: 's3:*'
+          Resource: !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+          Condition:
+            Bool:
+              'aws:SecureTransport': false
+
+  AmazonCloudWatchEventRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - events.amazonaws.com
+          Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: cwe-pipeline-execution
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action: 'codepipeline:StartPipelineExecution'
+            Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}'
+
+  AmazonCloudWatchEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        source:
+        - aws.codecommit
+        detail-type:
+        - CodeCommit Repository State Change
+        resources:
+        - !GetAtt CodeCommitRepository.Arn
+        detail:
+          event:
+          - referenceCreated
+          - referenceUpdated
+          referenceType:
+          - branch
+          referenceName:
+          - master
+      Targets:
+      - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}'
+        RoleArn: !GetAtt AmazonCloudWatchEventRole.Arn
+        Id: codepipeline-AppPipeline
+
+  AppPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+          - Name: SourceAction
+            ActionTypeId:
+              Category: Source
+              Owner: AWS
+              Version: '1'
+              Provider: CodeCommit
+            OutputArtifacts:
+            - Name: Source
+            Configuration:
+              BranchName: master
+              RepositoryName: !GetAtt CodeCommitRepository.Name
+              PollForSourceChanges: false
+            RunOrder: 1
+        - Name: Build
+          Actions:
+          - Name: Build
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Version: '1'
+              Provider: CodeBuild
+            InputArtifacts:
+            - Name: Source
+            Configuration:
+              ProjectName: !Ref CodeBuildProject
+              EnvironmentVariables: !Sub |
+                [{
+                  "name": "application_name",
+                  "type": "PLAINTEXT",
+                  "value": "${ImageRepository}"
+                },{
+                  "name": "builder",
+                  "type": "PLAINTEXT",
+                  "value": "${Builder}"
+                }]
+            RunOrder: 1
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactStoreBucket
+
+  CodePipelineServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - codepipeline.amazonaws.com
+          Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: AWS-CodePipeline
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'codecommit:CancelUploadArchive'
+            - 'codecommit:GetBranch'
+            - 'codecommit:GetCommit'
+            - 'codecommit:GetUploadArchiveStatus'
+            - 'codecommit:UploadArchive'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - 'codebuild:BatchGetBuilds'
+            - 'codebuild:StartBuild'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - 'lambda:InvokeFunction'
+            - 'lambda:ListFunctions'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - 'iam:PassRole'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - 'cloudwatch:*'
+            - 's3:*'
+            Resource: '*'
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        ImagePullCredentialsType: CODEBUILD
+        EnvironmentVariables:
+        - Name: AWS_ACCOUNT_ID
+          Type: PLAINTEXT
+          Value: !Ref AWS::AccountId
+      ServiceRole: !Ref CodeBuildRole
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CodeBuildLogGroup
+          Status: ENABLED
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          env:
+            variables:
+              builder: "paketobuildpacks/builder:base"
+              application_name: "buildpacks-test"
+              pack_version: "0.18.1"
+            exported-variables:
+            # Exported the image tag to be used later in the CodePipeline
+            - IMAGE_TAG
+
+          phases:
+            install:
+              commands:
+              # Download the pack linux binary
+              - wget -q https://github.com/buildpacks/pack/releases/download/v$pack_version/pack-v$pack_version-linux.tgz -O - | tar -xz
+              - chmod +x ./pack
+            pre_build:
+              commands:
+              # Log in to ECR
+              - ECR_DOMAIN="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+              - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_DOMAIN
+              # Set up some derived values for subsequent phases
+              - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+              - ECR_REPOSITORY="$ECR_DOMAIN/$application_name"
+              - IMAGE_TAG="$ECR_REPOSITORY:$COMMIT_HASH"
+            build:
+              commands:
+              - |
+                ./pack build --no-color --builder $builder \
+                --cache-image $ECR_REPOSITORY:cache \
+                --tag $IMAGE_TAG $ECR_REPOSITORY:latest \
+                --publish
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: AWS-CodeBuild
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Resource:
+            - !GetAtt CodeBuildLogGroup.Arn
+            - !Sub '${CodeBuildLogGroup.Arn}:*'
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          - Effect: Allow
+            Resource:
+            - !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+            Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:GetObjectVersion
+            - s3:GetBucketAcl
+            - s3:GetBucketLocation
+          - Action:
+            - ecr:BatchCheckLayerAvailability
+            - ecr:CompleteLayerUpload
+            - ecr:GetAuthorizationToken
+            - ecr:InitiateLayerUpload
+            - ecr:PutImage
+            - ecr:UploadLayerPart
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchGetImage
+            Resource: "*"
+            Effect: Allow
+
+  CodeBuildLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 7
+
+  S3Seed:
+    Type: Custom::S3Seed
+    Properties:
+      ServiceToken: !GetAtt S3SeedFunction.Arn
+      Region: !Ref AWS::Region
+
+  S3SeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import logging
+          import boto3
+          from botocore.vendored import requests
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+            logger.info('got event {}'.format(event))
+            responseData = {}
+
+            if event['RequestType'] == 'Delete':
+              s3_client = boto3.client('s3')
+              s3_client.delete_object(
+                  Bucket='${CodePipelineArtifactStoreBucket}',
+                  Key='src.zip',
+              )
+            else:
+              r = requests.post('https://start.spring.io/starter.zip', data = {'dependencies':'web,devtools'})
+
+              with open('/tmp/src.zip', 'wb') as f:
+                f.write(r.content)
+
+              s3 = boto3.resource('s3')
+              s3.meta.client.upload_file('/tmp/src.zip', '${CodePipelineArtifactStoreBucket}', 'src.zip', ExtraArgs={'ServerSideEncryption':'aws:kms',
+                  'SSEKMSKeyId':'alias/aws/s3'})
+                          
+            logger.info('responseData {}'.format(responseData))
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "SeedCode")
+
+      Handler: 'index.handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: 'python3.7'
+      Timeout: 30
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Resource:
+            - !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+            Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:GetObjectVersion
+            - s3:GetBucketAcl
+            - s3:GetBucketLocation
+            - s3:DeleteObject
+
+Outputs:
+  CodeCommitRepository:
+    Value: !GetAtt CodeCommitRepository.Name
+
+  CodePipeline:
+    Value: !Ref AppPipeline
+
+  EcrRepository:
+    Value: !Ref ImageRepository
+
+  PipelineS3Bucket:
+    Value: !Ref CodePipelineArtifactStoreBucket
