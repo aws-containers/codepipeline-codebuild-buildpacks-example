@@ -1,6 +1,6 @@
 # AWS CodePipeline & AWS CodeBuild with Cloud Native Buildpacks
 
-Pipeline that demonstrates how to integrate Cloud Native Buildpacks with AWS tools.
+Pipeline that demonstrates how to integrate Cloud Native Buildpacks with AWS tools. Please see this [blog post](https://aws.amazon.com/blogs/containers/creating-container-images-with-cloud-native-buildpacks-using-aws-codebuild-and-aws-codepipeline/) for details on how it can be used.
 
 This pipeline uses AWS DevOps tools AWS CodeCommit, AWS CodePipeline, AWS CodeBuild and Amazon Elastic Container Registry (ECR) along with other AWS services.
 
